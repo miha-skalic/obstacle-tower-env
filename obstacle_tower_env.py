@@ -23,26 +23,31 @@ class ObstacleTowerEnv(gym.Env):
     ALLOWED_VERSIONS = ['1', '1.1', '1.2']
 
     def __init__(self, environment_filename=None, docker_training=False, worker_id=0, retro=True,
-                 timeout_wait=30, realtime_mode=False):
+                 buffer=False, train_mode=True, floor=None, key_factor=1., max_levels=100,
+                 *args, **kwargs):
         """
         Arguments:
           environment_filename: The file path to the Unity executable.  Does not require the extension.
-          docker_training: Whether this is running within a docker environment and should use a virtual 
+          docker_training: Whether this is running within a docker environment and should use a virtual
             frame buffer (xvfb).
-          worker_id: The index of the worker in the case where multiple environments are running.  Each 
+          worker_id: The index of the worker in the case where multiple environments are running.  Each
             environment reserves port (5005 + worker_id) for communication with the Unity executable.
           retro: Resize visual observation to 84x84 (int8) and flattens action space.
-          timeout_wait: Time for python interface to wait for environment to connect.
-          realtime_mode: Whether to render the environment window image and run environment at realtime.
         """
+        self.buffer = buffer
+        self.frame_buffer = []
+
+        self.train_mode = train_mode
+        self.key_factor = key_factor
+
+        self.max_levels = max_levels
+        self.cleared_levels = 0
+
         if self.is_grading():
             environment_filename = None
             docker_training = True
 
-        self._env = UnityEnvironment(environment_filename,
-                                     worker_id,
-                                     docker_training=docker_training,
-                                     timeout_wait=timeout_wait)
+        self._env = UnityEnvironment(environment_filename, worker_id, docker_training=docker_training, *args, **kwargs)
 
         split_name = self._env.academy_name.split('-v')
         if len(split_name) == 2 and split_name[0] == "ObstacleTower":
@@ -54,11 +59,11 @@ class ObstacleTowerEnv(gym.Env):
 
         if self.version not in self.ALLOWED_VERSIONS:
             raise UnityGymException(
-                "Invalid Obstacle Tower version.  Your build is v" + self.version +
-                " but only the following versions are compatible with this gym: " +
+                "Invalid Obstacle Tower version.  Your build is v" + self.version + \
+                " but only the following versions are compatible with this gym: " + \
                 str(self.ALLOWED_VERSIONS)
             )
-
+        self._keys = 0
         self.visual_obs = None
         self._current_state = None
         self._n_agents = None
@@ -66,7 +71,8 @@ class ObstacleTowerEnv(gym.Env):
         self._flattener = None
         self._seed = None
         self._floor = None
-        self.realtime_mode = realtime_mode
+        if floor:
+            self.floor(floor)
         self.game_over = False  # Hidden flag used by Atari environments to determine if the game is over
         self.retro = retro
 
@@ -91,7 +97,7 @@ class ObstacleTowerEnv(gym.Env):
                            "Please note that only the first will be provided in the observation.")
 
         # Check for number of agents in scene.
-        initial_info = self._env.reset(train_mode=not self.realtime_mode)[self.brain_name]
+        initial_info = self._env.reset()[self.brain_name]
         self._check_agents(len(initial_info.agents))
 
         # Set observation and action spaces
@@ -121,7 +127,7 @@ class ObstacleTowerEnv(gym.Env):
         image_space = spaces.Box(
             0, image_space_max,
             dtype=image_space_dtype,
-            shape=(camera_height, camera_width, depth)
+            shape=(camera_height, camera_width, depth * max([1, self.buffer]))
         )
         if self.retro:
             self._observation_space = image_space
@@ -133,13 +139,22 @@ class ObstacleTowerEnv(gym.Env):
                 (image_space, keys_space, time_remaining_space)
             )
 
+    def reset_buffer(self, in_observation):
+        # self.frame_buffer = [np.zeros(camera_height, camera_width, depth) for i in range(self.buffer)]
+        self.frame_buffer = [in_observation for i in range(self.buffer)]
+
+    def buffer_step(self, in_observation):
+        self.frame_buffer.pop()
+        self.frame_buffer.append(in_observation)
+        return np.concatenate(self.frame_buffer, axis=-1)
+
     def done_grading(self):
         return self._done_grading
 
     def is_grading(self):
         return os.getenv('OTC_EVALUATION_ENABLED', False)
 
-    def reset(self):
+    def reset(self, train_mode=True, *args, **kwargs):
         """Resets the state of the environment and returns an initial observation.
         In the case of multi-agent environments, this is a list.
         Returns: observation (object/list): the initial observation of the
@@ -151,14 +166,21 @@ class ObstacleTowerEnv(gym.Env):
         if self._seed is not None:
             reset_params['tower-seed'] = self._seed
 
-        info = self._env.reset(config=reset_params,
-                               train_mode=not self.realtime_mode)[self.brain_name]
+        info = self._env.reset(config=reset_params, train_mode=train_mode and self.train_mode)[self.brain_name]
+        self._keys = 0
+
         n_agents = len(info.agents)
         self._check_agents(n_agents)
         self.game_over = False
+        self._keys = 0
 
         obs, reward, done, info = self._single_step(info)
-        return obs
+
+        if self.buffer:
+            self.reset_buffer(obs)
+        self.cleared_levels = 0
+
+        return self.buffer_step(obs) if self.frame_buffer else obs
 
     def step(self, action):
         """Run one timestep of the environment's dynamics. When end of
@@ -185,14 +207,30 @@ class ObstacleTowerEnv(gym.Env):
         self._check_agents(n_agents)
         self._current_state = info
 
+        keys = int(info.vector_observations[0][1:-1].sum())
+
+        reward_factor = 1.
+        if keys > self._keys:
+            reward_factor = self.key_factor
+
+        self._keys = keys # TODO
         obs, reward, done, info = self._single_step(info)
         self.game_over = done
 
+        # Check if level is completed
+        if 0.99 < reward < 1.01:
+            self.cleared_levels += 1
+
+        if self.cleared_levels == self.max_levels:
+            print("Max level reached!")
+            done = True
+
+        reward *= reward_factor
         if info.get('text_observation') == 'evaluation_complete':
             done = True
             self._done_grading = True
 
-        return obs, reward, done, info
+        return self.buffer_step(obs) if self.frame_buffer else obs, reward, done, info
 
     def _single_step(self, info):
         self.visual_obs = self._preprocess_single(info.visual_observations[0][0, :, :, :])
