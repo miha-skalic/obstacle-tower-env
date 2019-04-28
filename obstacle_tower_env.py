@@ -20,7 +20,7 @@ logger = logging.getLogger("gym_unity")
 
 
 class ObstacleTowerEnv(gym.Env):
-    ALLOWED_VERSIONS = ['1', '1.1', '1.2']
+    ALLOWED_VERSIONS = ['1', '1.1', '1.2', '1.3']
 
     def __init__(self, environment_filename=None, docker_training=False, worker_id=0, retro=True,
                  buffer=False, train_mode=True, floor=None, key_factor=1., max_levels=100,
@@ -144,7 +144,7 @@ class ObstacleTowerEnv(gym.Env):
         self.frame_buffer = [in_observation for i in range(self.buffer)]
 
     def buffer_step(self, in_observation):
-        self.frame_buffer.pop()
+        self.frame_buffer.pop(0)
         self.frame_buffer.append(in_observation)
         return np.concatenate(self.frame_buffer, axis=-1)
 
